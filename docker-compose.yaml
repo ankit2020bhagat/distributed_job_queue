@@ -1,0 +1,174 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: jobqueue-postgres
+    environment:
+      POSTGRES_USER: jobqueue
+      POSTGRES_PASSWORD: jobqueue123
+      POSTGRES_DB: jobqueue_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobqueue"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: jobqueue-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Zookeeper for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: jobqueue-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+
+  # Kafka Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: jobqueue-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # FastAPI Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobqueue-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+    volumes:
+      - ./app:/app/app
+      - ./config:/app/config
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Worker - High Priority
+  worker-high:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobqueue-worker-high
+    depends_on:
+      - app
+      - kafka
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+    command: python -m app.workers.job_worker --priority high --workers 4
+    deploy:
+      replicas: 2
+
+  # Worker - Medium Priority
+  worker-medium:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobqueue-worker-medium
+    depends_on:
+      - app
+      - kafka
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+    command: python -m app.workers.job_worker --priority medium --workers 3
+
+  # Worker - Low Priority
+  worker-low:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobqueue-worker-low
+    depends_on:
+      - app
+      - kafka
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+    command: python -m app.workers.job_worker --priority low --workers 2
+
+  # Scheduler
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobqueue-scheduler
+    depends_on:
+      - app
+      - postgres
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+    command: python -m app.workers.scheduler
+
+volumes:
+  postgres_data:
+  redis_data:
+  zookeeper_data:
+  zookeeper_logs:
+  kafka_data:
